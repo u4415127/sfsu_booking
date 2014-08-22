@@ -1,0 +1,27 @@
+*** date_ical_plugin_row_ical_feed_old.inc	2012-04-19 04:23:01.000000000 -0700
+--- date_ical_plugin_row_ical_feed.inc	2012-07-16 11:07:20.150665526 -0700
+***************
+*** 167,172 ****
+--- 167,176 ----
+      if ($all_day) {
+        $end->modify("+1 day");
+      }
++     else{
++       $start->setTimezone(new dateTimezone($item['timezone_db']));
++       $end->setTimezone(new dateTimezone($item['timezone_db']));
++     }
+  
+      module_load_include('inc', 'date_api', 'date_api_ical');
+      $item_text = '';
+***************
+*** 186,191 ****
+--- 190,198 ----
+      $event['url'] = url($uri['path'], $uri['options']);
+      $event['uid'] = !empty($entity->date_id) ? $entity->date_id[0] : $event['url'];
+      $event['rrule'] = $is_field && array_key_exists('rrule', $item) ? $item['rrule'] : '';
++     
++     //custom code
++     $event['location'] =(empty($entity->field_location)? NULL : $entity->field_location['und'][0]['safe_value']);
+  
+      return theme($this->theme_functions(),
+        array(

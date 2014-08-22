@@ -1,0 +1,178 @@
+<?php
+/**
+* Tests the functionality of the Simpletest example content type.
+*/
+include_once drupal_get_path('module', 'sfsu_booking') . '/sfsu_booking.features.inc';
+
+class SFSUBookingTestCase extends DrupalWebTestCase {
+  protected $privileged_user;
+
+
+  public static function getInfo() {
+    // Note: getInfo() strings are not translated with t().
+    return array(
+      'name' => 'SFSU Booking SimpleTest',
+      'description' => 'Basic funtionality test.',
+      'group' => 'Features',
+      'dependencies' => array('features' , 'rules' , 'flag', 'views' , 'strongarm' , 'taxonomy' , 'date' , 'comment'),
+    );
+  }
+
+  public function setUp() {
+    $info = drupal_parse_info_file(drupal_get_path('module', 'sfsu_booking') . '/sfsu_booking.info');
+    $info['dependencies'][] = 'sfsu_booking';
+    // Enable any modules required for the test.
+    $result = parent::setUp($info['dependencies']);
+//    
+    // Create and log in our privileged user.
+    $aggregate_permissions = array();
+    foreach (module_list() as $module) {
+      $permissions = module_invoke($module, 'permission');
+      if (isset($permissions)) {
+        array_merge($aggregate_permissions, $permissions);
+        unset($permissions);
+      }
+    }
+    $this->assertNotNull($aggregate_permissions, 'Check all permissions');
+    $perms = $this->checkPermissions(array('create appointment content','delete own appointment content','edit own appointment content',), TRUE);
+    $this->assertTrue($perms, "Check SFSU Booking Permissions");
+    if($perms){
+      $perms = array('create appointment content',
+                   'delete own appointment content',
+                   'edit own appointment content',
+      );
+      array_merge($aggregate_permissions, $perms);
+    }
+
+    $this->privileged_user = $this->drupalCreateUser($aggregate_permissions);
+    $this->drupalLogin($this->privileged_user);
+    foreach (array('administrator', 'host') as $value) {
+      $result = db_query("SELECT rid FROM {role} WHERE name=:name", 
+                        array(':name'=>$value));
+      $rid = $result->fetchField();
+      db_insert('users_roles')
+            ->fields(array('uid' => $this->privileged_user->uid, 'rid' => $rid,))
+            ->execute();
+      if($value == 'host'){
+        db_insert('role_permission')
+              ->fields(array('rid' => $rid, 'permission' => 'administer flags', 'module' => 'flag'))
+              ->execute();
+      }          
+    }
+
+    global $user;
+    $user = user_load($this->privileged_user->uid);
+  }
+ 
+  public function test_sfsu_booking(){
+    $this->sfsu_booking_setup();
+    
+    
+    $this->sfsu_booking_content_type_and_taxo();
+    $this->sfsu_booking_flag_and_rules();
+    $this->sfsu_booking_Cal();
+  }
+
+  private function sfsu_booking_setup(){
+    $vocab = taxonomy_vocabulary_machine_name_load('booking_status');
+    if($vocab){
+      $vid = $vocab->vid;
+     
+      // ADD terms
+      $terms_feature = array('Available', 'Booked', 'Expired');
+      foreach ($terms_feature as $term_feature) {
+        $term = taxonomy_get_term_by_name($term_feature, 'booking_status');
+        if (empty($term)) {
+          $term = new stdClass();
+          $term->name = $term_feature;
+          $term->vid = $vid;
+          taxonomy_term_save($term);
+        }
+      }
+    }
+  
+    // set default status
+    $result = db_query("SELECT data FROM {field_config_instance} WHERE field_name=:field_name", 
+                        array(':field_name'=>'field_booking_status'))
+              ->fetchField(); 
+    if($result){
+      $term = taxonomy_get_term_by_name('Available', 'booking_status');
+      $result = unserialize($result);
+      $result['default_value'][0]['tid'] = current($term)->tid;
+      $result = serialize($result);
+      db_update('field_config_instance') // Table name no longer needs {}
+        ->fields(array('data'=>$result))
+        ->condition('field_name','field_booking_status' , '=')
+        ->execute();    
+    }
+//    drupal_flush_all_caches();   
+  }  
+
+
+
+  private function sfsu_booking_Cal(){
+    features_revert(array('sfsu_booking'=>array('views_view')));
+//    features_revert();
+    drupal_flush_all_caches();
+    $this->drupalGet('booking/cal');
+    $this->assertText('Week of', 'Check Calendar date heading');
+    $this->assertText('No time slots for the selected week', 'Check Empty calendar text');
+/*   
+    $this->drupalGet('booking/week');
+    $this->assertText('Access denied', 'Check restrited access');
+    
+    $this->drupalGet('booking/day');
+    $this->assertText('Access denied', 'Check restrited access');
+*/
+
+    $this->drupalGet('admin/structure/types/manage/appointment/fields/field_user_host');
+    $this->drupalGet('admin/structure/types/manage/appointment/fields/field_booking_status');
+    
+    $this->drupalGet('booking/week');
+    $this->assertText('No time slots for the selected week', 'Check Empty calendar text');
+//    $this->assertText('Add Time Slots', 'Check Appointment Creation Form Block');
+    $this->drupalGet('booking/day');
+    $this->assertText('No time slots for the selected day', 'Check Empty calendar text');
+//    $this->assertText('Add Time Slots', 'Check Appointment Creation Form Block');
+  }
+  
+  
+  private function sfsu_booking_content_type_and_taxo(){    
+    $settings = array(
+      'type' => 'appointment', // This replaces the default type
+    );
+    $node = $this->drupalCreateNode($settings);
+    $this->assertEqual($node->type, 'appointment');
+    $this->drupalGet('node/' . $node->nid . '/edit');
+    $this->assertRaw('<span class="fieldset-legend">Time </span>', 'Check Time Field\' exists');
+    $this->assertRaw('edit-field-user-host-und', 'Check Host Field exists');
+    $this->assertRaw('edit-field-user-guest-und', 'Check Guest Field exists');
+    $this->assertRaw('edit-field-booking-status-und', 'Check Booking Status Field exists');
+    $this->assertRaw('edit-field-location-und-0-value', 'Check Location Field exists');
+    
+    $this->drupalGet('admin/structure/taxonomy/booking_status');
+    $this->assertText('Available', 'Check Taxonomy terms');
+  }
+  
+  private function sfsu_booking_flag_and_rules(){
+    $this->drupalGet('admin/structure/flags');
+    $this->assertText('appointment_booking', 'Check Flag "appointment_booking"');
+    
+    $this->drupalGet('admin/config/workflow/rules');
+    $this->assertText('Book Appointment', 'Check Rules "Book Appointment"');
+    $this->assertText('Booking expired time slot', 'Check Rules "Booking expired time slot"');
+    $this->assertText('Cancel Appointment(Rule)', 'Check Rules "Cancel Appointment(Rule)"');
+    $this->assertText('Slot Reserve', 'Check Rules "Slot Reserve"');
+
+    $this->drupalGet('admin/config/workflow/rules/components');
+    $this->assertText('Appointment Reminder', 'Check Rules "Appointment Reminder"');
+    $this->assertText('Cancel Appointment', 'Check Rules "Cancel Appointment"');
+    $this->assertText('Check time slot and react', 'Check Rules "Check time slot and react"');
+    $this->assertText('Remove Appointment Time Slot and Notify Guest', 'Check Rules "Remove Appointment Time Slot and Notify Guest"');
+    $this->assertText('Schedule time slot management', 'Check Rules "Schedule time slot management"');
+    $this->assertText('Send appointment confirmation', 'Check Rules "Send appointment confirmation"');
+    $this->assertText('Slot Duplicate', 'Check Rules "Slot Duplicate"');
+  }
+
+
+}

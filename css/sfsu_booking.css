@@ -1,0 +1,51 @@
+/* Hides un-needed elements */
+div.vertical-tabs.clearfix,
+/*div#edit-field-user-host,*/
+div#edit-field-user-guest,
+div#edit-field-booking-status,
+div#edit-field-status,
+div.form-item-path-pathauto,
+div.form-item-path-alias,
+fieldset#edit-domain,
+span.form-required
+{
+	display:none;
+}
+
+
+
+div.calendar.dayview,
+div.calendar.weekview
+{    /* Adds border to item box */ 
+	border-style:solid !important;
+	border-width:1px !important;
+}
+
+div.calendar-no-results-text
+{
+  text-align: center;
+}
+
+div.feed-icon{  float:right;    }
+img#ical-icon{  margin:0px;    }
+h2#calendar-title{ text-align:center; }    
+th.calendar-agenda-hour
+{
+    color:rgb(119,119,119);    
+    text-align: right;
+}
+
+.calendar-hour 
+{
+    font-size: 1.2em;
+    font-weight: bold;
+}
+.accessiblity-only
+{
+    position:absolute;
+    left:-10000px;
+    top:auto;
+    width:1px;
+    height:1px;
+    overflow:hidden;
+}

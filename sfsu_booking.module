@@ -1,0 +1,1026 @@
+<?php
+/**
+ * @file
+ * Code for the SFSU Booking feature.
+ */
+ 
+
+include_once 'sfsu_booking.features.inc';
+include_once drupal_get_path('module', 'features') . '/features.export.inc';
+include_once drupal_get_path('module', 'rules') . '/rules.module';
+
+function sfsu_booking_permission() {
+  return array(
+    'administer booking features' => array(
+      'title' => t('Administer booking features'), 
+      'description' => t('Perform administration tasks for booking features.'),
+    ),
+  );
+}
+
+/**
+ * Implementation of hook_install().
+ */
+function sfsu_booking_install(){
+  variable_set('sfsu_booking_color_avail', '#e0ffbd');  // status colors
+  variable_set('sfsu_booking_color_other', '#f3e891');
+  variable_set('sfsu_booking_first_run', TRUE);
+  
+  if(empty($GLOBALS['drupal_test_info']['test_run_id'])){
+    // Features module usually don't set settings correctly
+    // Reverting manually is usually required for first install
+    $states = features_get_component_states(array(), FALSE, FALSE);
+    $restore_states = array(FEATURES_OVERRIDDEN, FEATURES_REBUILDABLE, FEATURES_NEEDS_REVIEW);
+    $items = array();
+    foreach ($states as $module_name => $components) {
+      if($module_name == 'sfsu_booking'){
+        foreach ($components as $component => $state) {
+          if (in_array($state, $restore_states)) {
+              $items[$module_name][] = $component;
+          }
+        }//foreach
+        break;
+      }//if
+    }//foreach
+     
+    features_revert($items);
+  }
+ 
+  // Set referenceable roles for host field
+  $roles = user_roles(TRUE);
+  $result = db_query("SELECT data FROM {field_config} WHERE field_name=:field_name", 
+                  array(':field_name'=>'field_user_host'))
+            ->fetchField();  
+  $result = unserialize($result);
+  $rid = array_search('host', $roles);
+  if($rid === FALSE){
+    watchdog('sfsu_booking','Role \'Host\' is missing', NULL, WATCHDOG_WARNING);
+    return;
+  }
+
+  foreach ($result['settings']['referenceable_roles'] as $key => &$value) {
+    $value = ($key == $rid) ? $key : 0;
+  }
+  
+  db_update('field_config')
+      ->fields(array('data'=>serialize($result)))
+      ->condition('field_name','field_user_host' , '=')
+      ->execute();
+  
+}
+
+
+/**
+ * Implementation of Hook_enable()
+ */
+//function sfsu_booking_enable(){
+  // start appointment management rule
+   
+//}
+
+
+function sfsu_booking_disable(){
+  variable_del('sfsu_booking_color_avail');
+  variable_del('sfsu_booking_color_other');
+  
+  // disable calendar pages
+  
+  // stop appointment management rule
+  db_delete('rules_scheduler')
+    ->condition('config', 'rules_schedule_time_slot_management')
+    ->execute();
+}
+
+function sfsu_booking_init() {
+  if(variable_get('sfsu_booking_first_run', FALSE)){
+    rules_invoke_component('rules_schedule_time_slot_management');
+    variable_del('sfsu_booking_first_run');
+  }
+  
+  $options = array('group' => CSS_THEME, 'weight' => 20); 
+
+  if (arg(0) == 'booking') {  // add css to calendar pages
+    $SFSU_BOOKING_CSS = drupal_get_path('module', 'sfsu_booking') . '/css/sfsu_booking.css';
+    drupal_add_css($SFSU_BOOKING_CSS, $options);
+    return;
+  }
+  if (arg(0) == 'node') { // add css to appointment nodes
+    $node = node_load(arg(1));
+    if($node != FAlSE && $node->type == 'appointment'){
+      $SFSU_BOOKING_NODE_CSS = drupal_get_path('module', 'sfsu_booking') . '/css/sfsu_booking_node.css';
+      drupal_add_css($SFSU_BOOKING_NODE_CSS, $options);
+    }
+    return;
+  }
+
+  if(arg(0) == 'comment' || arg(1) == 'reply'){ // add css to comment saving page
+    $node = node_load(arg(2));
+    if($node != FAlSE && $node->type == 'appointment'){
+      $SFSU_BOOKING_COMMENT_CSS = drupal_get_path('module', 'sfsu_booking') . '/css/sfsu_booking_comment_form.css';
+      drupal_add_css($SFSU_BOOKING_COMMENT_CSS, $options);
+    }
+  }
+
+}
+
+
+// Changes comment save button text to custome text
+function sfsu_booking_form_comment_form_alter(&$form, &$form_state) {
+  if($form['#bundle'] == 'comment_node_appointment'){
+    $form['actions']['submit']['#value'] = t('Book Time Slot');
+  }
+}
+
+
+/**
+ * Implements hook_node_form_alter
+ * 
+ * This function performs several operations:
+ *    Overrides the default node form submittion function to a custom one
+ *    Sets fields according to features settings 
+ */
+function sfsu_booking_form_appointment_node_form_alter(&$form, &$form_state, $form_id){
+  $form['actions']['submit']['#submit'][0] = 'sfsu_booking_timeslot_submit';  // alter the submit function
+  $form['actions']['draft']['#type'] = 'hidden';
+  
+//  if(variable_get('sfsu_booking_host_default', FALSE)){
+    $form['field_user_host']['und']['#default_value'][0] = variable_get('sfsu_booking_host_default', 0);
+//  }
+//  else{
+//    unset($form['field_user_host']['und']['#default_value'][0]);
+//  }
+  
+  $form['field_location']['und'][0]['value']['#default_value']  = variable_get('sfsu_booking_location_default', '');
+  
+//  if(arg(0) == 'booking'){
+    if(!variable_get('sfsu_booking_host_selectable', TRUE)){
+      $form['field_user_host']['#type'] = 'hidden';
+    }
+    
+    if(!variable_get('sfsu_booking_location_settable', TRUE)){
+      $form['field_location']['#type'] = 'hidden';
+    }
+//  }
+
+  return;
+}
+
+/**
+ * Implements submittion function for Appointment Node Type
+ * 
+ * This is a custom function that allows creating nodes in different modes
+ * --User can save a single node if the difference between Start time and End time is equal to or less than time slot lengeth set in feature settings
+ * --User can save multiple nodes if the difference between Start and End is bigger than time slot length
+ * Upon saving, user is re-directed back to the calendar page
+ */
+function sfsu_booking_timeslot_submit($form, &$form_state){
+  $slot_length = variable_get('sfsu_booking_time_slot_length', 30);  // length for each time slot
+
+  // times cannot be outside of the below range
+  $top_bound = new DateTime(variable_get('sfsu_booking_time_slot_start_interval', '07:00:00'));
+  $low_bound = new DateTime(variable_get('sfsu_booking_time_slot_end_interval', '19:00:00'));
+  $low_bound->modify("-30 min");
+
+  $sfsu_booking_time_slot_number = variable_get('sfsu_booking_time_slot_number', 1);
+  if(is_numeric($sfsu_booking_time_slot_number)){
+    $sfsu_booking_time_slot_number = intval($sfsu_booking_time_slot_number);
+  }//if
+  else {
+    //if user enter something invalid reset it to just one loop
+    $sfsu_booking_time_slot_number = 1;
+  }//else
+  
+  $backup_node = node_form_submit_build_node($form, $form_state);
+  $start_time = new DateTime($backup_node->field_time['und'][0]['value'], new DateTimeZone('UTC'));    
+  $temp = clone $start_time;
+  $temp->modify("+ $slot_length min");
+  $end_time = new DateTime($backup_node->field_time['und'][0]['value2'], new DateTimeZone('UTC'));
+
+/*  Not available in php 5.2
+  $diff = $start_time->diff($end_time, TRUE);
+  $diff = $diff->h * 60 + $diff->i;
+  if($diff < 31){
+    $end_time = clone $temp;
+  }
+*/
+
+  if($start_time === $end_time || $end_time < $temp){
+    $end_time = clone $temp;
+  }  
+  while($temp <= $end_time){
+    $start_time->setTimezone(new DateTimeZone('America/Los_Angeles'));
+    if($start_time->format('H:i:s') < $top_bound->format('H:i:s') || $start_time->format('H:i:s') > $low_bound->format('H:i:s')  ||
+        stristr($start_time->format('D'), 'sat') || stristr($start_time->format('D'), 'sun'))
+    {
+      $start_time->modify("+ $slot_length min");
+      $temp->modify("+ $slot_length min");
+      continue;   //skip times outside of 8am and 5pm and during weekends
+    }
+    $start_time->setTimezone(new DateTimeZone('UTC'));
+
+    $count = 0;
+    while($count < $sfsu_booking_time_slot_number){
+      $count++;
+    
+      $node = clone $backup_node;
+      $node->field_time['und'][0]['value'] = $start_time->format('Y-m-d H:i:s');
+      $node->field_time['und'][0]['value2'] = $temp->format('Y-m-d H:i:s');
+    
+      $start_time->setTimezone(new DateTimeZone('America/Los_Angeles'));
+      $node->title = substr_replace($node->title, '- ' . $start_time->format('D, m/d/Y g:ia'), strpos($node->title, '-'));
+      $start_time->setTimezone(new DateTimeZone('UTC'));
+
+      $insert = empty($node->nid);
+      node_save($node);      
+
+      $node_link = l(t('view'), 'node/' . $node->nid);
+      $watchdog_args = array(
+        '@type' => $node->type,
+        '%title' => $node->title,
+      );
+      $t_args = array(
+        '@type' => node_type_get_name($node),
+        '%title' => $node->title,
+      );
+  
+      if ($insert) {
+        watchdog('content', '@type: added %title.', $watchdog_args, WATCHDOG_NOTICE, $node_link);
+  //      drupal_set_message(t('@type %title has been created.', $t_args));
+      }
+      else {
+        watchdog('content', '@type: updated %title.', $watchdog_args, WATCHDOG_NOTICE, $node_link);
+//        drupal_set_message(t('@type %title has been updated.', $t_args));
+      }
+    
+      if ($node->nid) {
+        $form_state['values']['nid'] = $node->nid;
+        $form_state['nid'] = $node->nid;
+        $form_state['redirect'] = 'node/' . $node->nid;
+      }
+      else {
+        // In the unlikely case something went wrong on save, the node will be
+        // rebuilt and node form redisplayed the same way as in preview.
+        drupal_set_message(t('The post could not be saved.'), 'error');
+        $form_state['rebuild'] = TRUE;
+      }
+    }//while
+  
+    $start_time->modify("+ $slot_length min");
+    $temp->modify("+ $slot_length min");
+  }//while
+  
+  // Clear the page and block caches.
+  cache_clear_all();
+  
+  drupal_goto($GLOBALS['base_root'] . $form['#action']);
+}
+
+
+
+function sfsu_booking_theme_registry_alter(&$theme_registry) {
+  // override calendar's template for day view with the one here
+  $template_path = drupal_get_path('module', 'sfsu_booking') . '/templates';
+  $theme_registry['calendar_day']['path'] = $template_path;
+  $theme_registry['calendar_item']['path'] = $template_path;
+  $theme_registry['calendar_week']['path'] = $template_path;
+
+  $theme_path = drupal_get_path('theme', $GLOBALS['theme_key']);
+ // ical template
+  $array = array(
+    'template' => 'node--appointment--ical',
+    'path' => $template_path,
+    'render element' => 'elements',
+    'base hook' => 'node',
+    'type' => 'theme_engine',
+    'theme path' => $theme_path,
+  );
+  $theme_registry['node__appointment__ical'] = $array;
+
+  // Appointment template
+  $array = array(
+    'template' => 'node--appointment',
+    'path' => $template_path,
+    'render element' => 'elements',
+    'base hook' => 'node',
+    'type' => 'theme_engine',
+    'theme path' => $theme_path,
+  );
+  $theme_registry['node__appointment'] = $array;
+}
+
+
+/*
+ * Implements hook_menu().
+ */
+function sfsu_booking_menu() {
+  $items = array();
+  
+  $items['admin/config/sfsu_features'] = array(
+    'title' => 'SFSU Features',
+    'description' => 'Settings for SFSU Features',
+    'access arguments' => array('administer site configuration'),
+    'type' => MENU_NORMAL_ITEM,
+   );
+
+  $items['admin/config/sfsu_features/sfsu_booking'] = array(
+    'title' => 'SFSU Booking settings',
+    'description' => 'General settings for users',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('sfsu_booking_form'),
+    'access arguments' => array('administer booking features'),
+    'type' => MENU_NORMAL_ITEM,
+   );
+
+  $items['admin/config/sfsu_features/sfsu_booking/general'] = array(
+    'title' => 'General Settings',
+    'description' => 'General settings for users',
+    'type' => MENU_DEFAULT_LOCAL_TASK,
+   );
+      
+  $items['admin/config/sfsu_features/sfsu_booking/admin'] = array(
+    'title' => 'Admin',
+    'description' => 'Site-wide settings',
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('sfsu_booking_admin_form'),
+    'access arguments' => array('administer booking features'),
+    'type' => MENU_LOCAL_TASK,
+    'weight'=> 10,
+   );   
+
+  return $items;
+}
+
+
+function sfsu_booking_form($form, &$form_state) {
+  $form['location'] = array(
+      '#type' => 'fieldset',
+      '#title' => t('Location Settings'),
+      '#collapsible' => TRUE,
+      '#collapsed' => FALSE,    
+  );
+  
+  $form['location']['sfsu_booking_location_default'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Default Appointment Location'),
+    '#default_value' => variable_get('sfsu_booking_location_default', ''),
+    '#size' => 15,
+    '#maxlength' => 30,
+//    '#description' => t('The default location for appointments.'),
+    '#required' => FALSE,
+    '#tree' => FALSE,
+  );
+
+  $form['host'] = array(
+      '#type' => 'fieldset',
+      '#title' => t('Host Settings'),
+      '#collapsible' => TRUE,
+      '#collapsed' => FALSE,
+  );
+  $form['host']['sfsu_booking_host_default'] = array(
+    '#type' => 'select',
+    '#title' => t('Default Host'),
+    '#options' => sfsu_booking_get_list_hosts(),    
+    '#default_value' => variable_get('sfsu_booking_host_default', 0),
+    '#tree' => FALSE,
+    '#description' => t('Select a default host. <br \>Note: if host is NOT selectable, then Default Host MUST NOT be none.')
+  ); 
+
+
+//  $form['#validate'][] = 'sfsu_booking_form_validation';
+  
+  return system_settings_form($form);
+}
+
+function sfsu_booking_admin_form($form, &$form_state) {
+  $form['item'] = array(
+    '#type' => 'item',
+    '#title' => 'Description:',
+    '#markup'=> 'These settings are site-wide so not domain compatible. Make sure to save settings for All Domains to avoid potential problems.',
+    );
+    
+  $form['domain'] = array(
+      '#type' => 'fieldset',
+      '#title' => t('Domain Access'),
+      '#collapsible' => TRUE,
+      '#collapsed' => FALSE,    
+  );
+  $form['domain']['sfsu_booking_domain_access'] = array(
+    '#type' => 'checkbox',
+    '#title' => '<b>' . t('Domain Access Compatibility') . '</b>',
+    '#default_value' => variable_get('sfsu_booking_domain_access', FALSE),
+    '#tree' => FALSE,
+//    '#description' => t('Enable Domain Access compatibiltiy.'),
+  );
+  
+  $form['blocks'] = array(
+      '#type' => 'fieldset',
+      '#title' => t('Block System'),
+      '#collapsible' => TRUE,
+      '#collapsed' => FALSE,    
+  );
+  $form['blocks']['sfsu_booking_blocks'] = array(
+    '#type' => 'checkbox',
+    '#title' => '<b>' . t('Block System Compatibility') . '</b>',
+    '#default_value' => variable_get('sfsu_booking_blocks', FALSE),
+    '#tree' => FALSE,
+//    '#description' => t('Enable Block System compatibiltiy.'),
+  );
+   
+  $form['general'] = array(
+      '#type' => 'fieldset',
+      '#title' => t('General Settings'),
+      '#collapsible' => TRUE,
+      '#collapsed' => FALSE,    
+  );
+  $form['general']['sfsu_booking_time_slot_length'] = array(
+    '#type' => 'select',
+    '#title' => t('Interval of Appointment Time Slot'),
+    '#options' => array('30'=> '30 min' , '60'=>'60 min'), 
+    '#default_value' => variable_get('sfsu_booking_time_slot_length', 30),
+    '#description' => t('The time length in minutes for each time slots.'),
+    '#required' => TRUE,
+    '#tree' => FALSE,
+  );
+
+  $time_interval = array(
+'00:00:00' => '12:00 AM',
+'00:30:00' => '12:30 AM',
+'01:00:00' => '1:00 AM',
+'01:30:00' => '1:30 AM',
+'02:00:00' => '2:00 AM',
+'02:30:00' => '2:30 AM',
+'03:00:00' => '3:00 AM',
+'03:30:00' => '3:30 AM',
+'04:00:00' => '4:00 AM',
+'04:30:00' => '4:30 AM',
+'05:00:00' => '5:00 AM',
+'05:30:00' => '5:30 AM',
+'06:00:00' => '6:00 AM',
+'06:30:00' => '6:30 AM',
+'07:00:00' => '7:00 AM',
+'07:30:00' => '7:30 AM',
+'08:00:00' => '8:00 AM',
+'08:30:00' => '8:30 AM',
+'09:00:00' => '9:00 AM',
+'09:30:00' => '9:30 AM',
+'10:00:00' => '10:00 AM',
+'10:30:00' => '10:30 AM',
+'11:00:00' => '11:00 AM',
+'11:30:00' => '11:30 AM',
+'12:00:00' => '12:00 PM',
+'12:30:00' => '12:30 PM',
+'13:00:00' => '1:00 PM',
+'13:30:00' => '1:30 PM',
+'14:00:00' => '2:00 PM',
+'14:30:00' => '2:30 PM',
+'15:00:00' => '3:00 PM',
+'15:30:00' => '3:30 PM',
+'16:00:00' => '4:00 PM',
+'16:30:00' => '4:30 PM',
+'17:00:00' => '5:00 PM',
+'17:30:00' => '5:30 PM',
+'18:00:00' => '6:00 PM',
+'18:30:00' => '6:30 PM',
+'19:00:00' => '7:00 PM',
+'19:30:00' => '7:30 PM',
+'20:00:00' => '8:00 PM',
+'20:30:00' => '8:30 PM',
+'21:00:00' => '9:00 PM',
+'21:30:00' => '9:30 PM',
+'22:00:00' => '10:00 PM',
+'22:30:00' => '10:30 PM',
+'23:00:00' => '11:00 PM',
+'23:30:00' => '11:30 PM'
+);
+
+  $form['general']['sfsu_booking_time_slot_start_interval'] = array(
+    '#type' => 'select',
+    '#title' => t('Appointment Calendar Start Time'),
+    '#options' => $time_interval,
+    '#default_value' => variable_get('sfsu_booking_time_slot_start_interval', '07:00:00'),
+    '#description' => t('The start time available for Appointment Time Slot'),
+    '#required' => TRUE,
+    '#tree' => FALSE,
+  );
+
+  $form['general']['sfsu_booking_time_slot_end_interval'] = array(
+    '#type' => 'select',
+    '#title' => t('Appointment Calendar End Time'),
+    '#options' => $time_interval,
+    '#default_value' => variable_get('sfsu_booking_time_slot_end_interval', '19:00:00'),
+    '#description' => t('The end time available for Appointment Time Slot'),
+    '#required' => TRUE,
+    '#tree' => FALSE,
+  );
+
+  $form['general']['sfsu_booking_time_slot_number'] = array(
+    '#type' => 'textfield',
+    '#title' => t('Number of timeslot to populate'),
+    '#size' => 20,
+    '#maxlength' => 2,
+    '#default_value' => variable_get('sfsu_booking_time_slot_number', 1),
+    '#description' => t('The amount of timeslot to populate on the same timeslot.'),
+    '#required' => TRUE,
+    '#tree' => FALSE,
+  );
+
+  $form['general']['sfsu_booking_cal_title'] = array(
+    '#type' => 'textfield',
+    '#title' => t("Calendar's Title"),
+    '#default_value' => variable_get('sfsu_booking_cal_title', ''),
+    '#size' => 20,
+    '#maxlength' => 50,
+    '#required' => FALSE,
+    '#tree' => FALSE,
+  );
+
+  // for #type == 'text_format', value will be saved in an array
+  $header_text = variable_get('sfsu_booking_cal_text', array('value'=>''));
+  $form['general']['sfsu_booking_cal_text'] = array(
+    '#type' => 'text_format',
+    '#title' => t('Header Text'),
+    '#default_value' => $header_text['value'],
+    '#description' => t('Additional header text displayed below title. This can be in HTML'),
+    '#format' => 'plain_text',
+    '#required' => FALSE,
+    '#tree' => FALSE,
+  );
+
+
+  $form['general']['sfsu_booking_main_cal_menu'] = array(
+    '#type' => 'textfield',
+    '#title' => t("Main Calendar's Menu Name"),
+    '#default_value' => variable_get('sfsu_booking_main_cal_menu', 'Appointment Calendar'),
+    '#size' => 30,
+    '#maxlength' => 50,
+    '#required' => TRUE,
+    '#tree' => FALSE,
+  );
+
+  $form['general']['sfsu_booking_week_cal_menu'] = array(
+    '#type' => 'textfield',
+    '#title' => t("Main Calendar's Menu Name"),
+    '#default_value' => variable_get('sfsu_booking_week_cal_menu', 'Appointment Calendar Administrator (Week)'),
+    '#size' => 30,
+    '#maxlength' => 50,
+    '#required' => TRUE,
+    '#tree' => FALSE,
+  );
+
+  $form['general']['sfsu_booking_day_cal_menu'] = array(
+    '#type' => 'textfield',
+    '#title' => t("Main Calendar's Menu Name"),
+    '#default_value' => variable_get('sfsu_booking_day_cal_menu', 'Appointment Calendar Administrator (Day)'),
+    '#size' => 30,
+    '#maxlength' => 50,
+    '#required' => TRUE,
+    '#tree' => FALSE,
+  );
+  
+  $form['host'] = array(
+      '#type' => 'fieldset',
+      '#title' => t('Host Settings'),
+      '#collapsible' => TRUE,
+      '#collapsed' => FALSE,
+  );
+  $form['host']['sfsu_booking_host_selectable'] = array(
+    '#type' => 'checkbox',
+    '#title' => '<b>' . t('Host Selectable') . '</b>',
+    '#default_value' => variable_get('sfsu_booking_host_selectable', TRUE),
+    '#tree' => FALSE,
+    '#description' => t('Check here if you want to make host selectable. <br \>Note: if host is NOT selectable, then Default Host MUST NOT be none.'),
+  );
+  
+  
+  $form['location'] = array(
+      '#type' => 'fieldset',
+      '#title' => t('Location Settings'),
+      '#collapsible' => TRUE,
+      '#collapsed' => FALSE,    
+  );    
+  $form['location']['sfsu_booking_location_settable'] = array(
+    '#type' => 'checkbox',
+    '#title' => '<b>' . t('Allow Changing Location') . '</b>',
+    '#default_value' => variable_get('sfsu_booking_location_settable', TRUE),
+    '#tree' => FALSE,
+    '#description' => t('Check here if you want to make location changable.'),
+  );
+  $form['emails'] = array(
+      '#type' => 'fieldset',
+      '#title' => t('Email Settings'),
+      '#collapsible' => TRUE,
+      '#collapsed' => FALSE,    
+  );
+/*
+  $form['emails']['sfsu_booking_notice_host'] = array(
+    '#type' => 'checkbox',
+    '#title' => '<b>' . t('Appointment Confirmation to Host') . '</b>',
+    '#default_value' => variable_get('sfsu_booking_notice_host', TRUE),
+    '#description' => t('Set whether to send an email to notify the host.'),
+    '#required' => FALSE,
+    '#tree' => FALSE,
+  );
+*/  
+  $form['emails']['sfsu_booking_appt_confirm'] = array(
+    '#type' => 'textarea',
+    '#title' => t('Appointment Confirmation'),
+    '#default_value' => variable_get('sfsu_booking_appt_confirm', "Confirming your appointment with [host], [location], [time].\n\nTo cancel the appointment, please follow the link and click on \"Cancel appointment.\"\n[input-node:url]"),
+    '#description' => t('The confirmation email message sent to the guest.'),
+    '#required' => FALSE,
+    '#tree' => FALSE,
+  );
+
+  $form['emails']['sfsu_booking_appt_cancel'] = array(
+    '#type' => 'textarea',
+    '#title' => t('Appointment cancellation'),
+    '#default_value' => variable_get('sfsu_booking_appt_cancel', "Your appointment is cancelled.  To reschedule appointment, please follow the link below and select a new time.\n[site:url]booking/cal"),
+    '#description' => t('The cancellation email message sent to the guest.'),
+    '#required' => FALSE,
+    '#tree' => FALSE,
+  );
+    
+  $form['emails']['sfsu_booking_appt_reminder'] = array(
+    '#type' => 'textarea',
+    '#title' => t('Appointment Reminder'),
+    '#default_value' => variable_get('sfsu_booking_appt_reminder', "This is a reminder for your appointment with [host], [location], [time]."),
+    '#description' => t('The email message sent to the guest before the appointment date.'),
+    '#required' => FALSE,
+    '#tree' => FALSE,
+  );
+  
+  $tokens = "<ul><li>[site:url] : Home Page URL</li><li>[location] : Appointment Location</li><li>[time] : Appointment Date and Time</li><li>[host] : Host Name</li></ul>";
+  $form['emails']['sfsu_booking_token_list'] = array(
+    '#type' => 'fieldset',
+    '#title' => t('Partial Token List'),
+    '#description' => $tokens,
+    '#collapsible' => TRUE,
+    '#collapsed' => TRUE, 
+  );
+  
+  $form['#validate'][] = 'sfsu_booking_admin_validation';
+  $form['#validate'][] = 'sfsu_booking_cal_form_validation';
+  $form['#validate'][] = 'sfsu_booking_email_form_validation';
+  return system_settings_form($form);
+}
+
+
+/**
+ * This fucntion return the list of available hosts for setting default host
+ */
+function sfsu_booking_get_list_hosts(){
+  $options = array(0 => 'None');
+  
+  $list = db_query("SELECT rid FROM {role} WHERE name='host'");
+  $list = $list->fetchField();
+  $list = db_query("SELECT uid FROM {users_roles} WHERE rid=:rid;", array(':rid'=>$list));
+  foreach($list as $uid){
+    $uid = $uid->uid;
+    $user = user_load($uid);
+    $name='';
+    if(!empty($user->field_firstname)){
+      $name = $user->field_firstname['und'][0]['value'];
+    }
+    if(!empty($user->field_lastname)){
+      $name .=' ' . $user->field_lastname['und'][0]['value'];
+    }
+    if(trim($name) == ''){
+      $name = $user->name;
+    }
+    $options[$uid] = $name;
+  }
+  return $options;
+}
+
+
+/*
+function sfsu_booking_form_validation($form, &$form_state){
+  if($form['location']['sfsu_booking_location_default']['#default_value'] != $form['location']['sfsu_booking_location_default']['#value']){
+    $result = db_query("SELECT data FROM {field_config_instance} WHERE field_name=:field_name", 
+                  array(':field_name'=>'field_location'))
+            ->fetchField(); 
+    if($result){
+      $need_clear_cache = TRUE;
+      
+      $result = unserialize($result);
+      $new_value = trim($form['location']['sfsu_booking_location_default']['#value']);
+      $result['default_value'] = $new_value ? array(array('value'=>$new_value)) : NULL;
+      $result = serialize($result);
+      db_update('field_config_instance')
+        ->fields(array('data'=>$result))
+        ->condition('field_name','field_location' , '=')
+        ->execute();    
+    }
+  }
+
+  if($form['host']['sfsu_booking_host_default']['#default_value'] != $form['host']['sfsu_booking_host_default']['#value']){
+    $result = db_query("SELECT data FROM {field_config_instance} WHERE field_name=:field_name", 
+                  array(':field_name'=>'field_user_host'))
+            ->fetchField(); 
+    if($result){
+      $need_clear_cache = TRUE;
+      
+      $result = unserialize($result);
+      $new_value = trim($form['host']['sfsu_booking_host_default']['#value']);
+      $result['default_value'] = $new_value ? array(array('uid'=>$new_value)) : NULL;
+      $result = serialize($result);
+      db_update('field_config_instance')
+        ->fields(array('data'=>$result))
+        ->condition('field_name','field_user_host' , '=')
+        ->execute();    
+    }
+  }
+}*/
+
+function sfsu_booking_admin_validation($form, &$form_state){
+  $need_clear_cache = FALSE;
+  
+  // set default end time
+  if($form['general']['sfsu_booking_time_slot_length']['#default_value'] != $form['general']['sfsu_booking_time_slot_length']['#value']){
+    $result = db_query("SELECT data FROM {field_config_instance} WHERE field_name=:field_name", 
+                  array(':field_name'=>'field_time'))
+            ->fetchField(); 
+    if($result){
+      $need_clear_cache = TRUE;
+      
+      $result = unserialize($result);
+      $result['settings']['default_value_code2'] = '+' . $form['general']['sfsu_booking_time_slot_length']['#value'] . ' min';
+      $result = serialize($result);
+      db_update('field_config_instance')
+        ->fields(array('data'=>$result))
+        ->condition('field_name','field_time' , '=')
+        ->execute();    
+    }
+  }
+  
+  if($form['blocks']['sfsu_booking_blocks']['#default_value'] != $form['blocks']['sfsu_booking_blocks']['#value']){
+    $pages = sfsu_booking_sfsu_features_page_list();
+    foreach ($pages as $page) {
+      $result = db_query("SELECT conf FROM {page_manager_handlers} WHERE name=:name", array(':name'=>"page_" . $page . "_panel_context"))
+              ->fetchField();
+      $result = unserialize($result);
+      $result['no_blocks'] = $form['blocks']['sfsu_booking_blocks']['#value'];
+      db_update('page_manager_handlers')
+        ->fields(array('conf'=>serialize($result)))
+        ->condition('name',"page_" . $page . "_panel_context" , '=')
+        ->execute(); 
+    }
+  }
+  
+}
+
+/**
+ * Sets calendar title, header text, and menu names
+ */
+function sfsu_booking_cal_form_validation($form, &$form_state){
+  $view = NULL;
+
+  if($form['domain']['sfsu_booking_domain_access']['#default_value'] != $form['domain']['sfsu_booking_domain_access']['#value']){
+    if(!$view){
+      $view = views_get_view('booking_calendar', TRUE);
+      $view->init_display();
+    }
+    
+    if($form['domain']['sfsu_booking_domain_access']['#value']){
+      $array = array(
+        'id'=>'current_all',
+        'table'=>'domain_access',
+        'field'=>'current_all',
+        'relationship'=>'none',
+        'group_type'=>'group',
+        'ui_name'=>'',
+        'operator'=>'=',
+        'value'=>'1',
+        'group'=>'1',
+        'exposed'=>FALSE,
+        'is_grouped'=>FALSE,
+      );
+      $view->display['default']->display_options['filters']['current_all'] = $array;    
+    }
+    else{
+      unset($view->display['default']->display_options['filters']['current_all']);
+    }//if-else
+  }//if
+
+
+  if($form['general']['sfsu_booking_cal_title']['#default_value'] != $form['general']['sfsu_booking_cal_title']['#value']){
+    if(!$view){
+      $view = views_get_view('booking_calendar', TRUE);
+      $view->init_display();
+    }     
+    foreach ($view->display['main_booking_cal']->display_options['header'] as $key => $value) {
+      if($value['label'] == 'Calendar Title'){
+        $view->display['main_booking_cal']->display_options['header'][$key]['content'] = '<h2 id="calendar-title">' . $form['general']['sfsu_booking_cal_title']['#value'] . '</h2>';
+        break;
+      }
+    }//foreach
+  }
+  
+  if($form['general']['sfsu_booking_cal_text']['#default_value'] != $form['general']['sfsu_booking_cal_text']['value']['#value']){
+    if(!$view){
+      $view = views_get_view('booking_calendar', TRUE);
+      $view->init_display();
+    } 
+    foreach ($view->display['main_booking_cal']->display_options['header'] as $key => $value) {
+      if($value['label'] == 'Header'){ 
+        $view->display['main_booking_cal']->display_options['header'][$key]['content'] = $form['general']['sfsu_booking_cal_text']['value']['#value'];
+        break;
+      }
+    }//foreach
+  }
+  
+  // a loop to update all calendar menu names
+  $cal_array = array('main_booking_cal'=>'sfsu_booking_main_cal_menu', 'week_booking_cal'=>'sfsu_booking_week_cal_menu', 'day_booking_cal'=>'sfsu_booking_day_cal_menu');
+  foreach ($cal_array as $cal_name => $var_name) {
+    if($form['general'][$var_name]['#default_value'] != $form['general'][$var_name]['#value']){
+      if(!$view){
+        $view = views_get_view('booking_calendar', TRUE);
+        $view->init_display();
+      }
+      $view->display[$cal_name]->display_options['menu']['title'] = $form['general'][$var_name]['#value'];
+    }      
+  }
+
+  if($view){
+    $view->save();
+  }
+}
+
+/**
+ * Sets email messages in rules
+ * Prone to failure due the high difficulty in working with Rules module
+ */
+function sfsu_booking_email_form_validation($form, &$form_state) {
+  try{
+    // set confirmation message
+    if($form['emails']['sfsu_booking_appt_confirm']['#default_value'] != $form['emails']['sfsu_booking_appt_confirm']['#value']){
+      $rule_child = NULL;
+      $rule = entity_load_single('rules_config', 'rules_send_booking_confirmation');
+      foreach ($rule->elements() as $value) {
+        if(isset($value->label) && $value->label == 'Send booking confirmation'){
+          $rule_child = $value;
+          break;
+        }
+      }
+      
+      if(!$rule_child){
+        throw new RulesException("Could not save email message(s). Please contact administrator or project maintainer.", 1);
+      }
+      
+      foreach ($rule_child->elements() as $value) {      
+        if(isset($value->settings['to:select']) && strstr($value->settings['to:select'], 'field-user-guest')){
+          $value->settings['message'] = sfsu_booking_insert_tokens('Send booking confirmation', $form['emails']['sfsu_booking_appt_confirm']['#value']);
+          $value->save();
+          $rule_child->save();
+          break;
+        }
+      }
+    }//if
+    
+    // set cancellation message
+    if($form['emails']['sfsu_booking_appt_cancel']['#default_value'] != $form['emails']['sfsu_booking_appt_cancel']['#value']){
+      $rule = entity_load_single('rules_config', 'rules_send_booking_confirmation');
+      foreach ($rule->elements() as $value) {
+        if(isset($value->label) && $value->label == 'Send Cancel Confirmation'){
+          $rule_child = $value;
+          break;
+        }
+      }
+      
+      if(!$rule_child){
+        throw new RulesException("Could not save email message(s). Please contact administrator.", 1);
+      }
+      
+      foreach ($rule_child->elements() as $value) {      
+        if(isset($value->settings['to:select']) && strstr($value->settings['to:select'], 'field-user-guest')){
+          $value->settings['message'] = sfsu_booking_insert_tokens('Send Cancel Confirmation', $form['emails']['sfsu_booking_appt_cancel']['#value']);
+          $value->save();
+          $rule_child->save();
+          break;
+        }
+      }
+    }//if
+    
+    // set reminder message
+    if($form['emails']['sfsu_booking_appt_reminder']['#default_value'] != $form['emails']['sfsu_booking_appt_reminder']['#value']){
+      $rule = entity_load_single('rules_config', 'rules_appointment_reminder');
+      $rule_child = $rule->elements()->current();
+      foreach ($rule_child->elements() as $value) {
+        if(isset($value->settings['message'])){
+          $value->settings['message'] = sfsu_booking_insert_tokens('rules_appointment_reminder' , $form['emails']['sfsu_booking_appt_reminder']['#value']);
+          $value->save();
+          $rule_child->save();
+          break;
+        }
+      }
+    }//if
+     
+  }
+  catch(RulesException $e){
+    form_set_error('emails', $e->getMessage());
+  }  
+}
+
+/**
+ * Replaces fake tokens with real ones before setting them in rules
+ */
+function sfsu_booking_insert_tokens($type, $msg){
+  $search = array('[location]', '[time]','[host]');
+  switch ($type) {
+      case 'Send booking confirmation':
+      case 'Send Cancel Confirmation': 
+        $replace = array('[input-node:field-location]',
+                        '[input-node:field-time:value]',
+                        '[input-node:field-user-host:field-firstname] [input-node:field-user-host:field-lastname]');
+          break;
+      case 'rules_appointment_reminder':
+        $replace = array('[node:field-location]',
+                        '[node:field-time:value]',
+                        '[node:field-user-host:field-firstname] [node:field-user-host:field-lastname]');
+          break;
+      default:
+        return FALSE;
+  }
+  
+  return str_replace($search , $replace, $msg);  
+}
+
+
+function sfsu_booking_help($path, $arg){
+  switch ($path) {
+      case 'admin/help#sfsu_booking':
+        $module_path = drupal_get_path('module', 'sfsu_booking');
+        $text = '<h2>SFSU Booking Help Page</h2>';
+        $text .= '<ul>';
+        $text .= '<li><p><b>For most general settings:</b><br />Configuration -> SFSU Features -> SFSU Booking settings<br/><img src="'. $GLOBALS['base_url'] . '/' . $module_path . '/misc/settings.png" alt="settings image"/></p>';
+        $text .= '<p>OR  Follow the link at the bottom of this page.</p></li>';
+        $text .= "<li><b>Note for Appointment Emails:</b><br/>";
+        $text .= "Some appointment emails are sent from the site email address. To change site email address, go to Configuration -> System -> Site information. Under section Site Details, change the Email address.</li>";
+        $text .= '<p><br /></p><li><p><b>To reset settings to their default values:</b><br />Structure -> Features -> SFSU Booking. Check the parts you want to reset and click the "Revert component" button</li>';
+        $text .= '</ul>';
+        return $text;
+  }
+}
+
+
+
+function sfsu_booking_templ_processor($items){
+  $slot_length = variable_get('sfsu_booking_time_slot_length', 30);
+  
+  // get system short time format
+  $system_time_format = variable_get('date_format_short', 'm/d/Y - H:i');
+  $system_time_format = substr($system_time_format, strpos($system_time_format, ':') - 1);
+  $meridian = strstr($system_time_format, 'a');
+  if(!$meridian){
+    $meridian = strstr($system_time_format, 'A');
+  }
+  if($meridian){
+    $system_time_format = str_replace($meridian,'', $system_time_format);
+  }
+
+  // construct time from 7am to 3pm
+
+  $time_1 = new DateTime(variable_get('sfsu_booking_time_slot_start_interval', '07:00:00'));
+  $temp = new DateTime(variable_get('sfsu_booking_time_slot_start_interval', '07:00:00'));
+  $time_2 = new DateTime(variable_get('sfsu_booking_time_slot_end_interval', '19:00:00'));
+  $time_2->modify("-30 min");
+  $noon = new DateTime('12:00:00');
+  
+  $all_time = array();
+  
+  while($time_1 <= $time_2){
+        $all_time[$time_1->format('H:i:s')] = array('ampm'=> ($meridian ? $time_1->format($meridian) : ''),
+                                                'hour'=> $time_1->format($system_time_format),
+                                                'time'=> $time_1->format('H:i:s'),
+                                               );
+    $time_1->modify("+$slot_length min");                             
+  }
+  
+  
+  foreach ($items as $key => $value) {
+    $hour = substr($key, 0, strpos($key, ':')) . ':00:00';
+    $hour = array_key_exists($key, $all_time)? $key : $hour;
+    
+    if(isset($all_time[$hour])) { 
+      if(empty($all_time[$hour]['values'])){
+          $all_time[$hour]['values'] = array();
+      }
+      foreach ($value['values'] as $day => $array) {
+        if(empty($all_time[$hour]['values'][$day])){
+             $all_time[$hour]['values'][$day] = array();
+         }
+         $all_time[$hour]['values'][$day] = array_merge($all_time[$hour]['values'][$day], $array);
+      }//foreach
+    }//if
+  }
+  
+  return $all_time;
+}
+
+
+function sfsu_booking_sfsu_features_menu_list(){
+  return array('booking/cal'=>'Appointment Calendar', 'booking/week'=>'Appointment Calendar Week','booking/day'=>'Appointment Calendar Day');
+}
+
+function sfsu_booking_sfsu_features_page_list(){
+  return array('appointment_calendar', 'appointment_calendar_week', 'appointment_calendar_day');
+}
